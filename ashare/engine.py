@@ -168,17 +168,22 @@ def constituents():
 
 
 def fetch_industry():
-    rows = []
-    for pn in range(1, 14):
-        j = sess_get(LURL, {"pn": pn, "pz": 1000, "np": 1, "ut": UT, "fltt": 2, "invt": 2,
+    rows, total, pn = [], None, 1
+    while True:
+        j = sess_get(LURL, {"pn": pn, "pz": 100, "np": 1, "ut": UT, "fltt": 2, "invt": 2,
                             "fid": "f3", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
                             "fields": "f12,f100"})
         d = (j.get("data") or {})
         diff = d.get("diff") or []
         if not diff:
             break
+        if total is None:
+            total = int(d.get("total") or 0)
         rows += [{"code": str(x["f12"]).zfill(6), "industry": x.get("f100") or ""} for x in diff]
-        if len(rows) >= (d.get("total") or 0):
+        if total and len(rows) >= total:
+            break
+        pn += 1
+        if pn > 80:
             break
     df = pd.DataFrame(rows).drop_duplicates("code")
     df.to_pickle(os.path.join(BASE, "industry.pkl"))
@@ -189,7 +194,7 @@ def cmd_fetch1():
     t0 = time.time()
     log("fetch1: index / boards / constituents / industry")
     fetch_index()
-    fetch_boards()
+    # 板块强度改由800只样本股按申万二级行业等权合成, 不再依赖东财板块接口
     cons = constituents()
     log("  cons %d (%s)" % (len(cons), cons["index"].value_counts().to_dict()))
     ind = fetch_industry()
@@ -264,7 +269,8 @@ def build_panel():
 W = {"trend": 0.25, "mom20": 0.25, "ret60": 0.10, "excess": 0.15,
      "volr": 0.10, "board": 0.15, "atrp": -0.15}
 HOLD = 10
-TP_ATR, SL_ATR = 3.0, 2.0
+TP_ATR, SL_ATR = 1.5, 1.0        # 主口径: 1.5ATR止盈 / 1.0ATR止损 (盈亏比1.5)
+TP2_ATR, SL2_ATR = 3.0, 2.0    # 对照口径: 3ATR / 2ATR (宽目标, 用于敏感性)
 
 
 def zs(s):
@@ -288,10 +294,6 @@ def cmd_report():
                 indmap[c] = b
     except Exception:
         pass
-    bperf = pd.read_pickle(os.path.join(BASE, "board_perf.pkl")).dropna(subset=["ret20"])
-    bperf["rank"] = bperf["ret20"].rank(ascending=False, method="min").astype(int)
-    bmap = dict(zip(bperf["board"], bperf["ret20"]))
-    brank = dict(zip(bperf["board"], bperf["rank"]))
 
     px = build_panel()
     close = px.pivot(index="date", columns="code", values="close").sort_index()
@@ -327,8 +329,13 @@ def cmd_report():
 
     names = pd.Series({c: consmap.get(c, "") for c in codes})
     is_st = names.str.contains("ST", na=False)
-    board_ret = pd.Series({c: bmap.get(indmap.get(c, ""), np.nan) for c in codes})
-    board_mat = pd.DataFrame(np.tile(board_ret.values, (len(close), 1)), index=close.index, columns=codes)
+    sec_of = pd.Series({c: (indmap.get(c) or "未分类") for c in codes})
+    grp = ret20.T.groupby(sec_of).mean()               # 行业等权20日涨幅 (行业 x 日期)
+    board_hist = grp.T.reindex(close.index)
+    board_mat = board_hist.loc[:, [sec_of[c] for c in codes]]
+    board_ret = pd.Series(board_mat.iloc[-1].values, index=codes)
+    bt = grp.iloc[:, -1].sort_values(ascending=False)
+    brank = {k: i + 1 for i, k in enumerate(bt.index)}
 
     factor = {"trend": trend, "mom20": mom20, "ret60": ret60,
               "excess": ret20.sub(hs_ret20, axis=0), "volr": volr,
@@ -353,10 +360,10 @@ def cmd_report():
             wsum += abs(w)
         return tot / wsum
 
-    def levels(i):
+    def levels(i, tp_atr=TP_ATR, sl_atr=SL_ATR):
         a = atrp.iloc[i].values
         a = np.where(np.isnan(a), np.nanmedian(a) if not np.all(np.isnan(a)) else 0.03, a)
-        return np.clip(TP_ATR * a, 0.04, 0.20), np.clip(SL_ATR * a, 0.03, 0.13)
+        return np.clip(tp_atr * a, 0.03, 0.20), np.clip(sl_atr * a, 0.02, 0.13)
 
     def outcome(i, tp, sl):
         entry = cm[i]
@@ -381,8 +388,8 @@ def cmd_report():
 
     last = T - 1
     start = max(60, last - 260)
-    wins, cnt, up = np.zeros(10), np.zeros(10), np.zeros(10)
-    for i in range(start, last):
+    wins, cnt, up, wins2 = np.zeros(10), np.zeros(10), np.zeros(10), np.zeros(10)
+    for i in range(start, last - HOLD + 1):
         ok = eligible(i)
         if ok.sum() < 100:
             continue
@@ -391,17 +398,24 @@ def cmd_report():
         q = pd.qcut(pd.Series(sc[idx]).rank(method="first"), 10, labels=False).values
         tp, sl = levels(i)
         w, _ = outcome(i, tp, sl)
+        tp2, sl2 = levels(i, TP2_ATR, SL2_ATR)
+        w2, _ = outcome(i, tp2, sl2)
         f10 = np.zeros(len(codes), bool)
         if i + HOLD < T:
-            f10 = (np.nan_to_num(cm[i + HOLD]) / np.nan_to_num(cm[i]) - 1) > 0.0015
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rr = cm[i + HOLD] / cm[i] - 1
+            f10 = np.nan_to_num(rr, nan=-9.0) > 0.0015
         for b in range(10):
             j = idx[q == b]
             cnt[b] += len(j)
             wins[b] += w[j].sum()
+            wins2[b] += w2[j].sum()
             up[b] += f10[j].sum()
     p_bucket = [wins[b] / cnt[b] if cnt[b] else np.nan for b in range(10)]
     p_up = [up[b] / cnt[b] if cnt[b] else np.nan for b in range(10)]
     base = wins.sum() / max(1, cnt.sum())
+    base2 = wins2.sum() / max(1, cnt.sum())
+    breakeven = SL_ATR / (TP_ATR + SL_ATR)
     log("  calibration %d days, base %.1f%%" % (last - start, base * 100))
 
     ok = eligible(last)
@@ -423,10 +437,12 @@ def cmd_report():
          "board_hot": int((live["board_ret20"] > 0.40).sum()),
          "board_missing": int(live["board_ret20"].isna().sum()),
          "ret20_negative": int((live["ret20"] < 0).sum()),
+         "ret20_hot_over_40pct": int((live["ret20"] > 0.40).sum()),
          "atr_over_9pct": int((live["atrp"] > 0.09).sum()),
          "below_ma60": int((live["trend"] < 0).sum())}
     pool = live[(live["board_ret20"] >= -0.05) & (live["board_ret20"] <= 0.40)
-                & (live["ret20"] >= 0) & (live["atrp"] <= 0.09) & (live["trend"] >= 0)]
+                & (live["ret20"] >= 0) & (live["ret20"] <= 0.40)
+                & (live["atrp"] <= 0.09) & (live["trend"] >= 0)]
     pool = pool.dropna(subset=["p_tgt"]).sort_values("score", ascending=False)
     f["pool_after_filters"] = int(len(pool))
 
@@ -475,9 +491,10 @@ def cmd_report():
                "n_above_ma60": int(ab.sum()),
                "med_ret20": round(float(pd.Series(ret20.iloc[last].values).median()) * 100, 2)}
 
-    bt = bperf.sort_values("ret20", ascending=False)
-    top = [{"board": r.board, "ret20": round(float(r.ret20) * 100, 1)} for r in bt.head(8).itertuples()]
-    bot = [{"board": r.board, "ret20": round(float(r.ret20) * 100, 1)} for r in bt.tail(8).itertuples()]
+    top = [{"board": k, "ret20": round(float(v) * 100, 1), "n": int((sec_of == k).sum())}
+           for k, v in bt.head(8).items()]
+    bot = [{"board": k, "ret20": round(float(v) * 100, 1), "n": int((sec_of == k).sum())}
+           for k, v in bt.tail(8).items()]
 
     pick_list = []
     for code, r in picks:
@@ -502,12 +519,16 @@ def cmd_report():
            "universe": {"n": int(len(codes)), "n_eligible": int(ok.sum())},
            "market": {"index": idxm, "verdict": verdict, "phase": phase, "breadth": breadth,
                       "avg_ret20": round(a20 * 100, 2), "avg_ret5": round(a5 * 100, 2),
-                      "boards_top": top, "boards_bottom": bot, "n_boards": int(len(bperf))},
+                      "boards_top": top, "boards_bottom": bot, "n_boards": int(len(bt))},
            "calibration": {"days": int(last - start), "base_rate": round(float(base) * 100, 1),
                            "bucket_p": [None if np.isnan(x) else round(float(x) * 100, 1) for x in p_bucket],
                            "bucket_up": [None if np.isnan(x) else round(float(x) * 100, 1) for x in p_up],
                            "bucket_n": [int(x) for x in cnt],
-                           "horizon_days": HOLD, "tp_atr": TP_ATR, "sl_atr": SL_ATR},
+                           "bucket_p_wide": [None if cnt[b] == 0 else round(float(wins2[b] / cnt[b]) * 100, 1) for b in range(10)],
+                           "base_rate_wide": round(float(base2) * 100, 1),
+                           "breakeven_pct": round(float(breakeven) * 100, 1),
+                           "horizon_days": HOLD, "tp_atr": TP_ATR, "sl_atr": SL_ATR,
+                           "wide_tp_atr": TP2_ATR, "wide_sl_atr": SL2_ATR},
            "filters": f, "picks": pick_list,
            "risk_note": "概率是过去260个交易日同分数桶的历史统计值，样本内边缘很薄，不是盈利保证。"}
     fp = os.path.join(BASE, "report_%s.json" % out["date"])
