@@ -168,23 +168,23 @@ def constituents():
 
 
 def fetch_industry():
-    rows, total, pn = [], None, 1
-    while True:
+    def page(pn):
         j = sess_get(LURL, {"pn": pn, "pz": 100, "np": 1, "ut": UT, "fltt": 2, "invt": 2,
                             "fid": "f3", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
                             "fields": "f12,f100"})
         d = (j.get("data") or {})
-        diff = d.get("diff") or []
-        if not diff:
-            break
-        if total is None:
-            total = int(d.get("total") or 0)
-        rows += [{"code": str(x["f12"]).zfill(6), "industry": x.get("f100") or ""} for x in diff]
-        if total and len(rows) >= total:
-            break
-        pn += 1
-        if pn > 80:
-            break
+        return int(d.get("total") or 0), (d.get("diff") or [])
+
+    def rows_of(diff):
+        return [{"code": str(x["f12"]).zfill(6), "industry": x.get("f100") or ""} for x in diff]
+
+    total, first = page(1)
+    rows = rows_of(first)
+    n = (total + 99) // 100
+    if n > 1:
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for _t, diff in ex.map(page, range(2, n + 1)):
+                rows += rows_of(diff)
     df = pd.DataFrame(rows).drop_duplicates("code")
     df.to_pickle(os.path.join(BASE, "industry.pkl"))
     return df
