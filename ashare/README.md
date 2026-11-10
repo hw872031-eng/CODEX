@@ -9,11 +9,12 @@
 mkdir -p ~/ashare/kl && cd ~/ashare
 curl -sSL https://raw.githubusercontent.com/hw872031-eng/CODEX/main/ashare/engine.py -o engine.py
 
-python3 engine.py fetch1          # 指数 / 成分股 / 行业分类  约30-60秒
+python3 engine.py fetch1          # 指数 / 成分股 / 行业分类  约32秒
 python3 engine.py fetch2 400      # 日线，每次最多400只，重复跑到 800/800
 python3 engine.py report          # 出报告，约5秒（缓存命中）
 ```
 
+冷启动（本地无任何缓存）全套约 66 秒：fetch1 32s + fetch2 15s×2 + report 5s。
 报告写到 `~/ashare/report_YYYY-MM-DD.json`，并复制一份到 `/mnt/files`。
 只依赖 `requests` `pandas` `numpy`。
 
